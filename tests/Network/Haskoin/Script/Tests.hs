@@ -1,3 +1,7 @@
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE BangPatterns #-}
 module Network.Haskoin.Script.Tests (tests) where
 
 import Test.QuickCheck.Property (Property, (==>))
@@ -9,11 +13,18 @@ import Test.Framework.Runners.Console (defaultMainWithArgs)
 
 import qualified Test.HUnit as HUnit
 
+import Network.BitcoinRPC
+
 import Control.Applicative ((<$>))
 
 import Numeric (readHex)
 
-import qualified Data.Aeson as A (decode)
+import Control.Lens
+
+import qualified Data.Aeson as A
+import qualified Data.Aeson.Lens as AL
+import qualified Data.Aeson.Types as AT
+
 import Data.Bits (setBit, testBit)
 import Text.Read (readMaybe)
 import Data.Binary (Binary, Word8)
@@ -30,9 +41,10 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
     ( pack
     , unpack
+    , toStrict
     )
 
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 
 import Data.Binary (encode, decodeOrFail)
 
@@ -41,7 +53,7 @@ import qualified Data.ByteString.Lazy.Char8 as C (readFile)
 import Data.Int (Int64)
 
 import Network.Haskoin.Protocol.Arbitrary ()
-import Network.Haskoin.Script.Arbitrary 
+import Network.Haskoin.Script.Arbitrary
 
 import Network.Haskoin.Script
 import Network.Haskoin.Script.Evaluator
@@ -49,6 +61,8 @@ import Network.Haskoin.Crypto
 import Network.Haskoin.Protocol
 import Network.Haskoin.Util
 
+
+import qualified Data.Map as M
 
 tests :: [Test]
 tests = 
@@ -223,53 +237,60 @@ parseScript script =
                     parseOp = encodeBytes <$> (readMaybe $ "OP_" ++ tok)
                     encodeBytes = LBS.unpack . encode
 
-testFile :: String -> String -> Bool -> Test
-testFile groupLabel path expected = buildTest $ do
+getExecError :: (Script -> Script -> SigCheck -> String)
+getExecError sig key sigCheck =
+  case execScript sig key sigCheck of
+      Left e -> show e
+      Right _ -> "none"
+
+
+readTests :: String -- ^ path
+          -> IO [(Script, Script, String)] -- ^ pairs of (sig, pubKey, comment)
+readTests path = do
     dat <- C.readFile path
     case (A.decode dat) :: Maybe [[String]] of
-        Nothing -> return $
-                    testCase groupLabel $
-                    HUnit.assertFailure $ "can't read test file " ++ path
-        Just testDefs -> return $ testGroup groupLabel $ map parseTest testDefs
+        Nothing -> fail "can't parse JSON"
+        Just testDefs -> sequence $ map parseTest testDefs
 
-    where   parseTest :: [String] -> Test
+    where   parseTest :: [String] -> IO (Script, Script, String)
             parseTest (sig:pubKey:[])       = makeTest "" sig pubKey
             parseTest (sig:pubKey:label:[]) = makeTest label sig pubKey
+            parseTest v = fail $ "unknown test format" ++ (show v)
 
-            parseTest v =
-                testCase "can't parse test case" $
-                         HUnit.assertFailure $ "json element " ++ show v
-
-            makeTest :: String -> String -> String -> Test
-            makeTest label sig pubKey =
-                testCase label' $ case (parseScript sig, parseScript pubKey) of
-                    (Left e, _) -> parseError $ "can't parse sig: " ++
-                                                show sig ++ " error: " ++ e
-                    (_, Left e) -> parseError $ "can't parse key: " ++
-                                                show pubKey ++ " error: " ++ e
+            makeTest :: String -> String -> String -> IO (Script, Script, String)
+            makeTest comment sig pubKey =
+                case (parseScript sig, parseScript pubKey) of
+                    (Left e, _) -> fail $ label ++ " can't parse sig: " ++
+                                          show sig ++ " error: " ++ e
+                    (_, Left e) -> fail $ label ++ "can't parse key: " ++
+                                          show pubKey ++ " error: " ++ e
                     (Right scriptSig, Right scriptPubKey) ->
-                        runTest scriptSig scriptPubKey
+                        return $ (scriptSig, scriptPubKey, label)
 
-                where label' = "sig: [" ++ sig ++ "] " ++
+                where label = "sig: [" ++ sig ++ "] " ++
                                " pubKey: [" ++ pubKey ++ "] " ++
                                (if null label
                                     then ""
-                                    else " label: " ++ label)
+                                    else " comment: " ++ comment)
 
-            parseError message = HUnit.assertBool
-                                ("parse error in valid script: " ++ message)
-                                (expected == False)
 
-            runTest scriptSig scriptPubKey =
-                HUnit.assertBool
-                  (" eval error: " ++ errorMessage)
-                  (expected == run evalScript)
+execFileTests :: String -- ^ group label
+              -> String -- ^ path
+              -> (Script -> Script -> String -> Test) -- ^ single test function
+              -> Test   -- ^ test result
 
-                where run f = f scriptSig scriptPubKey rejectSignature
-                      errorMessage = case run execScript of
-                        Left e -> show e
-                        Right _ -> " none"
+execFileTests groupLabel path makeTest = buildTest $ do
+    tests <- readTests path
+    return $ testGroup groupLabel $ map makeTest' tests
+    where makeTest' (sig, pubKey, comment) = makeTest sig pubKey comment
 
+makeHaskoinEvalTest :: Bool -> Script -> Script -> String -> Test
+makeHaskoinEvalTest expected sig pubKey label = testCase label $
+  HUnit.assertBool label (expected == evalScript sig pubKey rejectSignature)
+
+testFile :: String -> String -> Bool -> Test
+testFile groupLabel path expected =
+  execFileTests groupLabel path (makeHaskoinEvalTest expected)
 
 -- repl utils
 
@@ -292,3 +313,65 @@ testInvalid = testFile "Canonical Valid Script Test Cases"
 
 runTests :: [Test] -> IO ()
 runTests ts = defaultMainWithArgs ts ["--hide-success"]
+
+
+-- RPC tests
+--
+-- needs patched bitcoind that supports 'execscript' rpc command
+
+class (A.ToJSON a, A.FromJSON e) => RPCRequest a e r | a -> e, a -> r
+  where
+    -- | Parse result field in response given corresponding request.
+    parseRPCResult :: a -> AT.Value -> AT.Parser r
+
+    -- | Parse error field of response given corresponding request.
+    parseRPCError :: a -> AT.Value -> AT.Parser e
+
+    -- | Parse response using request.
+    parseRPCResponse :: a -> AT.Value -> AT.Parser (Either e r, Int)
+    parseRPCResponse a = AT.withObject "response" $ \o -> do
+        i <- o AT..: "id"
+        o AT..:? "error" AT..!= AT.Null >>= \e -> case e of
+            AT.Null -> o AT..: "result" >>= \r -> do
+                res <- parseRPCResult a r
+                return (Right res, i)
+            _ -> do
+                err <- parseRPCError a e
+                return (Left err, i)
+
+
+makeRPCTest :: Bool -> Script -> Script -> String -> Test
+makeRPCTest expected scriptSig scriptPubKey comment = buildTest $
+    do putStrLn $ "makeRPCTest: " ++ comment ++
+                  "\n    hex sig: " ++ hexSig ++
+                  "\n    hex key: " ++ hexKey
+       res <- callApi rpcAuth "execscript" params
+       case res of
+           Right (A.Object v) ->
+               do putStrLn $ "response: " ++ show v
+                  return $ testCase comment
+                         $ HUnit.assertBool
+                           "eval error" (expected == parseResponse v)
+           Right _ -> return $ testCase comment
+                             $ HUnit.assertBool "unexpected parse result" False
+           Left error -> do putStrLn $ "rpc error: " ++ error
+                            return $ testCase comment
+                                   $ HUnit.assertBool
+                                     ("rpc error: " ++ show error) False
+    where
+        rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
+        toHex s = bsToHex $ encode' $ Script s
+        hexSig = toHex $ scriptOps scriptSig
+        hexKey = toHex $ scriptOps scriptPubKey
+        params = LBS.toStrict . A.encode $ [hexSig, hexKey]
+        parseResponse v = case AT.parse getValue v of
+          AT.Success True -> True
+          _ -> False
+        getValue o = o A..: "valid"
+
+runRPCTests :: IO ()
+runRPCTests =
+  let label = "RPC tests"
+      path = "tests/data/script_valid.json"
+      rpcTest = execFileTests label path (makeRPCTest True)
+  in runTests [rpcTest]
