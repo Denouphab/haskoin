@@ -199,6 +199,12 @@ testEncodeBool b = (decodeBool $ encodeBool b) == b
 rejectSignature :: SigCheck
 rejectSignature _ _ _ = False
 
+evalScript' :: Script -> Script -> Bool
+evalScript' sig pubKey = evalScript sig pubKey rejectSignature
+
+execScript' :: Script -> Script -> Either EvalError Program
+execScript' sig pubKey = execScript sig pubKey rejectSignature
+
 {- Parse tests from bitcoin-qt repository -}
 
 type ParseError = String
@@ -259,12 +265,10 @@ parseScript script =
                               (readMaybe ("OP_" ++ tok) :: Maybe ScriptOp)
 
 
-getExecError :: (Script -> Script -> SigCheck -> String)
-getExecError sig key sigCheck =
-  case execScript sig key sigCheck of
-      Left e -> show e
-      Right _ -> "none"
-
+getExecError :: (Script -> Script -> String)
+getExecError sig key = case execScript' sig key of
+                            Left e -> show e
+                            Right _ -> "none"
 
 
 readTests :: String -> IO [TestParseResult]
@@ -310,7 +314,7 @@ makeHaskoinEvalTest expected (Right (TestData sig pubKey label)) =
   testCase label $ HUnit.assertBool label (expected == evalResult)
   where evalResult = case (decodeScript sig, decodeScript pubKey) of
             (Right scriptSig, Right scriptPubKey) ->
-                evalScript scriptSig scriptPubKey rejectSignature
+                evalScript' scriptSig scriptPubKey
             _ -> False
 
 testFile :: String -> String -> Bool -> Test
@@ -324,7 +328,7 @@ execScriptIO sig key = case (parseDecode sig, parseDecode key) of
   (Left e, _) -> print $ "sig parse error: " ++ e
   (_, Left e) -> print $ "key parse error: " ++ e
   (Right scriptSig, Right scriptPubKey) ->
-      case execScript scriptSig scriptPubKey rejectSignature of
+      case execScript' scriptSig scriptPubKey of
           Left e -> putStrLn $ "error " ++ show e
           Right p -> do putStrLn $ "successful execution"
                         putStrLn $ dumpStack $ runStack p
@@ -345,26 +349,6 @@ runTests ts = defaultMainWithArgs ts ["--hide-success"]
 --
 -- needs patched bitcoind that supports 'execscript' rpc command
 
-class (A.ToJSON a, A.FromJSON e) => RPCRequest a e r | a -> e, a -> r
-  where
-    -- | Parse result field in response given corresponding request.
-    parseRPCResult :: a -> AT.Value -> AT.Parser r
-
-    -- | Parse error field of response given corresponding request.
-    parseRPCError :: a -> AT.Value -> AT.Parser e
-
-    -- | Parse response using request.
-    parseRPCResponse :: a -> AT.Value -> AT.Parser (Either e r, Int)
-    parseRPCResponse a = AT.withObject "response" $ \o -> do
-        i <- o AT..: "id"
-        o AT..:? "error" AT..!= AT.Null >>= \e -> case e of
-            AT.Null -> o AT..: "result" >>= \r -> do
-                res <- parseRPCResult a r
-                return (Right res, i)
-            _ -> do
-                err <- parseRPCError a e
-                return (Left err, i)
-
 evalRawRPC :: EncodedScript -> EncodedScript -> IO Bool
 evalRawRPC sigData pubKeyData =
     callApi rpcAuth "execscript" params >>= traceResponse >>= evalResponse
@@ -379,8 +363,9 @@ evalRawRPC sigData pubKeyData =
               AT.Success True -> True
               _ -> False
           getValue o = o A..: "valid"
-          traceResponse v = do -- putStrLn $ "response: " ++ 
-                               -- (bsToString . LBS.toStrict) (A.encode v)
+          traceResponse v = do -- putStrLn $ "response: " ++
+                               --         (bsToString . LBS.toStrict)
+                               --         (A.encode v)
                                return v
 
 evalRpc :: Script -> Script -> IO Bool
@@ -428,9 +413,8 @@ runStaticComparisonTest =
       cmpTest _ = testCase "ignore parse errors" $
                   HUnit.assertBool "ignore parse errors" True
 
-      evalEncoded sig key = case evalScript <$> decodeScript sig
-                                            <*> decodeScript key
-                                            <*> return rejectSignature of
+      evalEncoded sig key = case evalScript' <$> decodeScript sig
+                                             <*> decodeScript key of
                                  Right result -> return result
                                  Left _ -> return False
 
@@ -439,10 +423,12 @@ runStaticComparisonTest =
   in runTests [cmpTestValid, cmpTestInvalid]
 
 
+compareEval :: Script -> Script -> IO Bool
+compareEval sig pubKey = ((==) (evalScript' sig pubKey)) <$> evalRpc sig pubKey
+
 testCompareScript :: Script -> Script -> Property
-testCompareScript sig pubKey = QM.monadicIO $
-    do rpcResult <- QM.run $ evalRpc sig pubKey
-       QM.assert $ rpcResult == evalScript sig pubKey rejectSignature
+testCompareScript sig pubKey =
+    QM.monadicIO $ QM.assert =<< (QM.run $ compareEval sig pubKey)
 
 
 testDeep :: IO ()
