@@ -1,13 +1,15 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE BangPatterns #-}
 module Network.Haskoin.Script.Tests (tests) where
-
 
 import System.TimeIt (timeItT)
 
+import Debug.Trace (traceM)
+
+import Test.QuickCheck
 import Test.QuickCheck.Property (Property, (==>))
+import qualified Test.QuickCheck.Monadic as QM (monadicIO, PropertyM, assert, run)
 import Test.Framework (Test, testGroup, buildTest)
 import Test.Framework.Providers.HUnit (testCase)
 import Test.Framework.Providers.QuickCheck2 (testProperty)
@@ -18,7 +20,7 @@ import qualified Test.HUnit as HUnit
 
 import Network.BitcoinRPC
 
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>), (<*>))
 
 import Numeric (readHex)
 
@@ -30,7 +32,6 @@ import qualified Data.Aeson.Types as AT
 
 import Data.Bits (setBit, testBit)
 import Text.Read (readMaybe)
-import Data.Binary (Binary, Word8)
 import Data.List (isPrefixOf)
 import Data.Char (ord)
 import qualified Data.ByteString as BS
@@ -51,7 +52,13 @@ import qualified Data.ByteString.Lazy as LBS
 
 import Data.Maybe (catMaybes, fromMaybe)
 
-import Data.Binary (encode, decodeOrFail)
+import Data.Binary
+    ( Binary
+    , Word8
+    , encode
+    , decode
+    , decodeOrFail
+    )
 
 import qualified Data.ByteString.Lazy.Char8 as C (readFile)
 
@@ -71,7 +78,7 @@ import Control.Monad
 import qualified Data.Map as M
 
 tests :: [Test]
-tests = 
+tests =
     [ testGroup "Script types"
         [ testProperty "ScriptOp" (metaGetPut :: ScriptOp -> Bool)
         , testProperty "Script" (metaGetPut :: Script -> Bool)
@@ -101,6 +108,10 @@ tests =
     , testFile "Canonical Invalid Script Test Cases"
                "tests/data/script_invalid.json"
                False
+    , testGroup "Compare Haskoin Impl against Bitcoin Impl"
+        [ testProperty "Haskoin evalScript == Bitcoin evalScript"
+                       testCompareScript
+        ]
     ]
 
 metaGetPut :: (Binary a, Eq a) => a -> Bool
@@ -212,8 +223,8 @@ decodeScript bytes = case decodeOrFail bytes of
 parseScript :: String -> Either ParseError EncodedScript
 parseScript script =
     do  bytes <- LBS.concat <$> mapM parseToken (words script)
-        script <- decodeScript bytes
-        when (encode script /= bytes) $ Left "encode . decode bytes /= bytes"
+        -- script <- decodeScript bytes
+        -- when (encode script /= bytes) $ Left "encode . decode bytes /= bytes"
         return bytes
     where parseToken :: String -> Either ParseError EncodedScript
           parseToken tok =
@@ -354,36 +365,43 @@ class (A.ToJSON a, A.FromJSON e) => RPCRequest a e r | a -> e, a -> r
                 err <- parseRPCError a e
                 return (Left err, i)
 
+evalRawRPC :: EncodedScript -> EncodedScript -> IO Bool
+evalRawRPC sigData pubKeyData =
+    callApi rpcAuth "execscript" params >>= traceResponse >>= evalResponse
+    where evalResponse (Right (A.Object v)) = return $ parseResponse v
+          evalResponse (Right _) = fail "unexpected response type"
+          evalResponse (Left error) = fail $ "RPC error: " ++ error
+          rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
+          hexSig = bsToHex $ LBS.toStrict sigData
+          hexKey = bsToHex $ LBS.toStrict pubKeyData
+          params = LBS.toStrict . A.encode $ [hexSig, hexKey]
+          parseResponse v = case AT.parse getValue v of
+              AT.Success True -> True
+              _ -> False
+          getValue o = o A..: "valid"
+          traceResponse v = do -- putStrLn $ "response: " ++ 
+                               -- (bsToString . LBS.toStrict) (A.encode v)
+                               return v
+
+evalRpc :: Script -> Script -> IO Bool
+evalRpc sig pubKey = evalRawRPC (encode sig) (encode pubKey)
+
+evalRpcString :: String -> String -> IO Bool
+evalRpcString sig pubKey =
+    case evalRpc <$> (decodeScript =<< parseScript sig)
+                 <*> (decodeScript =<< parseScript pubKey) of
+        Left error -> fail $ "decode error: " ++ error
+        Right result -> result
 
 makeRPCTest :: Bool -> TestParseResult -> Test
 makeRPCTest expected (Left error) =
   testCase error $ HUnit.assertBool "parse error" (expected == False)
-makeRPCTest expected (Right (TestData scriptSig scriptPubKey comment)) =
-  buildTest $
-       do res <- callApi rpcAuth "execscript" params
-          case res of
-               Right (A.Object v) ->
-                   do -- putStrLn $ "response: " ++ show v
-                      return $ testCase comment
-                             $ HUnit.assertBool
-                               "eval error" (expected == parseResponse v)
-               Right _ -> return $ testCase comment
-                                 $ HUnit.assertBool
-                                   "unexpected parse result" False
-               Left error -> do putStrLn $ "rpc error: " ++ error
-                                return $ testCase comment
-                                       $ HUnit.assertBool
-                                         ("rpc error: " ++ show error) False
-    where
-        rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
-        hexSig = bsToHex $ LBS.toStrict scriptSig
-        hexKey = bsToHex $ LBS.toStrict scriptPubKey
-        params = LBS.toStrict . A.encode $ [hexSig, hexKey]
-        -- params = LBS.toStrict . A.encode $ (["51", "51"] :: [String])
-        parseResponse v = case AT.parse getValue v of
-          AT.Success True -> True
-          _ -> False
-        getValue o = o A..: "valid"
+makeRPCTest expected (Right (TestData sigData pubKeyData comment)) =
+  buildTest $ do rpcResult <- evalRawRPC sigData pubKeyData
+                 return $ testCase comment $ HUnit.assertBool
+                                             "unexpected result"
+                                             (rpcResult == expected)
+
 
 runRPCTests :: IO ()
 runRPCTests =
@@ -393,3 +411,41 @@ runRPCTests =
       rpcTestValid = execFileTests label pathValid (makeRPCTest True)
       rpcTestInvalid = execFileTests label pathInvalid (makeRPCTest False)
   in runTests [rpcTestValid, rpcTestInvalid]
+
+
+runStaticComparisonTest :: IO ()
+runStaticComparisonTest =
+  let label = "RPC tests"
+      pathValid = "tests/data/script_valid.json"
+      pathInvalid = "tests/data/script_invalid.json"
+
+      cmpTest (Right (TestData sig key comment)) =
+        buildTest $ do rpcResult <- evalRawRPC sig key
+                       evalResult <- evalEncoded sig key
+                       return $ testCase comment $
+                                HUnit.assertBool "unequal result"
+                                (rpcResult == evalResult)
+      cmpTest _ = testCase "ignore parse errors" $
+                  HUnit.assertBool "ignore parse errors" True
+
+      evalEncoded sig key = case evalScript <$> decodeScript sig
+                                            <*> decodeScript key
+                                            <*> return rejectSignature of
+                                 Right result -> return result
+                                 Left _ -> return False
+
+      cmpTestValid = execFileTests label pathValid cmpTest
+      cmpTestInvalid = execFileTests label pathInvalid cmpTest
+  in runTests [cmpTestValid, cmpTestInvalid]
+
+
+testCompareScript :: Script -> Script -> Property
+testCompareScript sig pubKey = QM.monadicIO $
+    do rpcResult <- QM.run $ evalRpc sig pubKey
+       QM.assert $ rpcResult == evalScript sig pubKey rejectSignature
+
+
+testDeep :: IO ()
+testDeep = quickCheckWith (stdArgs { maxSuccess = 10000
+                                   , maxDiscardRatio = 10000 })
+                          testCompareScript
