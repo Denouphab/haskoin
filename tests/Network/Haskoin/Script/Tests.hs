@@ -4,6 +4,9 @@
 {-# LANGUAGE BangPatterns #-}
 module Network.Haskoin.Script.Tests (tests) where
 
+
+import System.TimeIt (timeItT)
+
 import Test.QuickCheck.Property (Property, (==>))
 import Test.Framework (Test, testGroup, buildTest)
 import Test.Framework.Providers.HUnit (testCase)
@@ -61,6 +64,7 @@ import Network.Haskoin.Crypto
 import Network.Haskoin.Protocol
 import Network.Haskoin.Util
 
+import Control.Monad
 
 import qualified Data.Map as M
 
@@ -195,18 +199,9 @@ parseHex' (a:b:xs) = case readHex $ [a, b] :: [(Integer, String)] of
 parseHex' [_] = Nothing
 parseHex' [] = Just []
 
-parseScript :: String -> Either ParseError Script
-parseScript script =
-      case parseBytes of
-          Left e -> Left $ "string decode error: " ++ e
-          Right bytes -> case decodeOrFail $ LBS.pack bytes of
-              Left  (_, _, e) -> Left $ "byte decode error: " ++ e ++
-                                        "bytes: " ++ (bsToHex $ BS.pack bytes)
-              Right (_, _, Script s) -> Right Script { scriptOps = s }
-      where
-          parseBytes :: Either ParseError [Word8]
-          parseBytes = concat <$> mapM parseToken (words script)
-          parseToken :: String -> Either ParseError [Word8]
+parseScript :: String -> Either ParseError [Word8]
+parseScript script = concat <$> mapM parseToken (words script)
+    where parseToken :: String -> Either ParseError [Word8]
           parseToken tok =
               case alternatives of
                     (ops:_) -> Right ops
@@ -237,6 +232,11 @@ parseScript script =
                     parseOp = encodeBytes <$> (readMaybe $ "OP_" ++ tok)
                     encodeBytes = LBS.unpack . encode
 
+decodeScript :: [Word8] -> Either ParseError Script
+decodeScript bytes = case decodeOrFail $ LBS.pack bytes of
+    Left (_, _, message) -> Left message
+    Right (_, _, script) -> Right script
+
 getExecError :: (Script -> Script -> SigCheck -> String)
 getExecError sig key sigCheck =
   case execScript sig key sigCheck of
@@ -244,28 +244,27 @@ getExecError sig key sigCheck =
       Right _ -> "none"
 
 
-readTests :: String -- ^ path
-          -> IO [(Script, Script, String)] -- ^ pairs of (sig, pubKey, comment)
+data TestData = TestData [Word8] [Word8] String
+type TestParseResult = Either ParseError TestData
+
+readTests :: String -> IO [TestParseResult]
 readTests path = do
     dat <- C.readFile path
     case (A.decode dat) :: Maybe [[String]] of
         Nothing -> fail "can't parse JSON"
-        Just testDefs -> sequence $ map parseTest testDefs
+        Just testDefs -> return $ map parseTest testDefs
 
-    where   parseTest :: [String] -> IO (Script, Script, String)
+    where   parseTest :: [String] -> TestParseResult
             parseTest (sig:pubKey:[])       = makeTest "" sig pubKey
             parseTest (sig:pubKey:label:[]) = makeTest label sig pubKey
             parseTest v = fail $ "unknown test format" ++ (show v)
 
-            makeTest :: String -> String -> String -> IO (Script, Script, String)
+            makeTest :: String -> String -> String -> TestParseResult
             makeTest comment sig pubKey =
                 case (parseScript sig, parseScript pubKey) of
-                    (Left e, _) -> fail $ label ++ " can't parse sig: " ++
-                                          show sig ++ " error: " ++ e
-                    (_, Left e) -> fail $ label ++ "can't parse key: " ++
-                                          show pubKey ++ " error: " ++ e
-                    (Right scriptSig, Right scriptPubKey) ->
-                        return $ (scriptSig, scriptPubKey, label)
+                    (Left e, _) -> Left $ "parse error: sig"
+                    (_, Left e) -> Left $ "parse error: pubKey"
+                    (Right sig, Right pubKey) -> Right $ TestData sig pubKey label
 
                 where label = "sig: [" ++ sig ++ "] " ++
                                " pubKey: [" ++ pubKey ++ "] " ++
@@ -276,17 +275,23 @@ readTests path = do
 
 execFileTests :: String -- ^ group label
               -> String -- ^ path
-              -> (Script -> Script -> String -> Test) -- ^ single test function
+              -> (TestParseResult -> Test) -- ^ single test function
               -> Test   -- ^ test result
 
-execFileTests groupLabel path makeTest = buildTest $ do
+execFileTests groupLabel path runTest = buildTest $ do
     tests <- readTests path
-    return $ testGroup groupLabel $ map makeTest' tests
-    where makeTest' (sig, pubKey, comment) = makeTest sig pubKey comment
+    return $ testGroup groupLabel $ map runTest tests
 
-makeHaskoinEvalTest :: Bool -> Script -> Script -> String -> Test
-makeHaskoinEvalTest expected sig pubKey label = testCase label $
-  HUnit.assertBool label (expected == evalScript sig pubKey rejectSignature)
+makeHaskoinEvalTest :: Bool -> TestParseResult -> Test
+makeHaskoinEvalTest expected (Left e) =
+  testCase e $ HUnit.assertBool "parse error where valid exec is expected"
+                                (expected == False)
+makeHaskoinEvalTest expected (Right (TestData sig pubKey label)) =
+  testCase label $ HUnit.assertBool label (expected == evalResult)
+  where evalResult = case (decodeScript sig, decodeScript pubKey) of
+            (Right scriptSig, Right scriptPubKey) ->
+                evalScript scriptSig scriptPubKey rejectSignature
+            _ -> False
 
 testFile :: String -> String -> Bool -> Test
 testFile groupLabel path expected =
@@ -295,7 +300,7 @@ testFile groupLabel path expected =
 -- repl utils
 
 execScriptIO :: String -> String -> IO ()
-execScriptIO sig key = case (parseScript sig, parseScript key) of
+execScriptIO sig key = case (parseDecode sig, parseDecode key) of
   (Left e, _) -> print $ "sig parse error: " ++ e
   (_, Left e) -> print $ "key parse error: " ++ e
   (Right scriptSig, Right scriptPubKey) ->
@@ -303,7 +308,8 @@ execScriptIO sig key = case (parseScript sig, parseScript key) of
           Left e -> putStrLn $ "error " ++ show e
           Right p -> do putStrLn $ "successful execution"
                         putStrLn $ dumpStack $ runStack p
-
+  where parseDecode :: String -> Either ParseError Script
+        parseDecode s = (parseScript s) >>= decodeScript
 
 testValid = testFile "Canonical Valid Script Test Cases"
             "tests/data/script_valid.json" True
@@ -340,30 +346,31 @@ class (A.ToJSON a, A.FromJSON e) => RPCRequest a e r | a -> e, a -> r
                 return (Left err, i)
 
 
-makeRPCTest :: Bool -> Script -> Script -> String -> Test
-makeRPCTest expected scriptSig scriptPubKey comment = buildTest $
-    do putStrLn $ "makeRPCTest: " ++ comment ++
-                  "\n    hex sig: " ++ hexSig ++
-                  "\n    hex key: " ++ hexKey
-       res <- callApi rpcAuth "execscript" params
-       case res of
-           Right (A.Object v) ->
-               do putStrLn $ "response: " ++ show v
-                  return $ testCase comment
-                         $ HUnit.assertBool
-                           "eval error" (expected == parseResponse v)
-           Right _ -> return $ testCase comment
-                             $ HUnit.assertBool "unexpected parse result" False
-           Left error -> do putStrLn $ "rpc error: " ++ error
-                            return $ testCase comment
-                                   $ HUnit.assertBool
-                                     ("rpc error: " ++ show error) False
+makeRPCTest :: Bool -> TestParseResult -> Test
+makeRPCTest expected (Left error) =
+  testCase error $ HUnit.assertBool "parse error" (expected == False)
+makeRPCTest expected (Right (TestData scriptSig scriptPubKey comment)) =
+  buildTest $
+       do res <- callApi rpcAuth "execscript" params
+          case res of
+               Right (A.Object v) ->
+                   do -- putStrLn $ "response: " ++ show v
+                      return $ testCase comment
+                             $ HUnit.assertBool
+                               "eval error" (expected == parseResponse v)
+               Right _ -> return $ testCase comment
+                                 $ HUnit.assertBool
+                                   "unexpected parse result" False
+               Left error -> do putStrLn $ "rpc error: " ++ error
+                                return $ testCase comment
+                                       $ HUnit.assertBool
+                                         ("rpc error: " ++ show error) False
     where
         rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
-        toHex s = bsToHex $ encode' $ Script s
-        hexSig = toHex $ scriptOps scriptSig
-        hexKey = toHex $ scriptOps scriptPubKey
+        hexSig = bsToHex $ BS.pack scriptSig
+        hexKey = bsToHex $ BS.pack scriptPubKey
         params = LBS.toStrict . A.encode $ [hexSig, hexKey]
+        -- params = LBS.toStrict . A.encode $ (["51", "51"] :: [String])
         parseResponse v = case AT.parse getValue v of
           AT.Success True -> True
           _ -> False
@@ -372,6 +379,8 @@ makeRPCTest expected scriptSig scriptPubKey comment = buildTest $
 runRPCTests :: IO ()
 runRPCTests =
   let label = "RPC tests"
-      path = "tests/data/script_valid.json"
-      rpcTest = execFileTests label path (makeRPCTest True)
-  in runTests [rpcTest]
+      pathValid = "tests/data/script_valid.json"
+      pathInvalid = "tests/data/script_invalid.json"
+      rpcTestValid = execFileTests label pathValid (makeRPCTest True)
+      rpcTestInvalid = execFileTests label pathInvalid (makeRPCTest False)
+  in runTests [rpcTestValid, rpcTestInvalid]
