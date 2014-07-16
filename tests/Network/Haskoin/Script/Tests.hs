@@ -42,7 +42,9 @@ import qualified Data.ByteString as BS
     )
 
 import qualified Data.ByteString.Lazy as LBS
-    ( pack
+    ( ByteString
+    , concat
+    , pack
     , unpack
     , toStrict
     )
@@ -189,6 +191,9 @@ rejectSignature _ _ _ = False
 {- Parse tests from bitcoin-qt repository -}
 
 type ParseError = String
+type EncodedScript = LBS.ByteString
+data TestData = TestData EncodedScript EncodedScript String
+type TestParseResult = Either ParseError TestData
 
 parseHex' :: String -> Maybe [Word8]
 parseHex' (a:b:xs) = case readHex $ [a, b] :: [(Integer, String)] of
@@ -199,43 +204,49 @@ parseHex' (a:b:xs) = case readHex $ [a, b] :: [(Integer, String)] of
 parseHex' [_] = Nothing
 parseHex' [] = Just []
 
-parseScript :: String -> Either ParseError [Word8]
-parseScript script = concat <$> mapM parseToken (words script)
-    where parseToken :: String -> Either ParseError [Word8]
+decodeScript :: LBS.ByteString -> Either ParseError Script
+decodeScript bytes = case decodeOrFail bytes of
+    Left (_, _, error) -> Left $ "decode error: " ++ error
+    Right (_, _, script) -> Right script
+
+parseScript :: String -> Either ParseError EncodedScript
+parseScript script =
+    do  bytes <- LBS.concat <$> mapM parseToken (words script)
+        script <- decodeScript bytes
+        when (encode script /= bytes) $ Left "encode . decode bytes /= bytes"
+        return bytes
+    where parseToken :: String -> Either ParseError EncodedScript
           parseToken tok =
               case alternatives of
                     (ops:_) -> Right ops
                     _ -> Left $ "unknown token " ++ tok
-              where alternatives :: [[Word8]]
+              where alternatives :: [EncodedScript]
                     alternatives = catMaybes  [ parseHex
                                               , parseInt
                                               , parseQuote
                                               , parseOp
                                               ]
-                    parseHex | "0x" `isPrefixOf` tok = parseHex' (drop 2 tok)
+                    parseHex | "0x" `isPrefixOf` tok =
+                                    LBS.pack <$> parseHex' (drop 2 tok)
                              | otherwise = Nothing
                     parseInt = fromInt . fromIntegral <$>
                                (readMaybe tok :: Maybe Integer)
-                    parseQuote | tok == "''" = Just [0]
-                               | (head tok) == '\'' && (last tok) == '\'' =
-                                 Just $ encodeBytes $ opPushData $ BS.pack
+                    parseQuote | tok == "''" = Just $ LBS.pack [0]
+                               | head tok == '\'' && last tok == '\'' =
+                                 Just $ encode $ opPushData $ BS.pack
                                       $ map (fromIntegral . ord)
                                       $ init . tail $ tok
                                | otherwise = Nothing
-                    fromInt :: Int64 -> [Word8]
-                    fromInt n | n ==  0 = [0x00]
-                              | n == -1 = [0x4f]
-                              | 1 <= n && n <= 16 = [0x50 + fromIntegral n]
-                              | otherwise = encodeBytes
-                                                $ opPushData $ BS.pack
-                                                $ encodeInt n
-                    parseOp = encodeBytes <$> (readMaybe $ "OP_" ++ tok)
-                    encodeBytes = LBS.unpack . encode
+                    fromInt :: Int64 -> EncodedScript
+                    fromInt n | n ==  0 = LBS.pack [0x00]
+                              | n == -1 = LBS.pack [0x4f]
+                              | 1 <= n &&
+                                n <= 16 = LBS.pack [0x50 + fromIntegral n]
+                              | otherwise = encode $ opPushData $ BS.pack
+                                                   $ encodeInt n
+                    parseOp = encode <$>
+                              (readMaybe ("OP_" ++ tok) :: Maybe ScriptOp)
 
-decodeScript :: [Word8] -> Either ParseError Script
-decodeScript bytes = case decodeOrFail $ LBS.pack bytes of
-    Left (_, _, message) -> Left message
-    Right (_, _, script) -> Right script
 
 getExecError :: (Script -> Script -> SigCheck -> String)
 getExecError sig key sigCheck =
@@ -244,26 +255,24 @@ getExecError sig key sigCheck =
       Right _ -> "none"
 
 
-data TestData = TestData [Word8] [Word8] String
-type TestParseResult = Either ParseError TestData
 
 readTests :: String -> IO [TestParseResult]
 readTests path = do
     dat <- C.readFile path
-    case (A.decode dat) :: Maybe [[String]] of
+    case A.decode dat :: Maybe [[String]] of
         Nothing -> fail "can't parse JSON"
         Just testDefs -> return $ map parseTest testDefs
 
     where   parseTest :: [String] -> TestParseResult
             parseTest (sig:pubKey:[])       = makeTest "" sig pubKey
             parseTest (sig:pubKey:label:[]) = makeTest label sig pubKey
-            parseTest v = fail $ "unknown test format" ++ (show v)
+            parseTest v = fail $ "unknown test format" ++ show v
 
             makeTest :: String -> String -> String -> TestParseResult
             makeTest comment sig pubKey =
                 case (parseScript sig, parseScript pubKey) of
-                    (Left e, _) -> Left $ "parse error: sig"
-                    (_, Left e) -> Left $ "parse error: pubKey"
+                    (Left e, _) -> Left $ "parse error: sig: " ++ e
+                    (_, Left e) -> Left $ "parse error: pubKey: " ++ e
                     (Right sig, Right pubKey) -> Right $ TestData sig pubKey label
 
                 where label = "sig: [" ++ sig ++ "] " ++
@@ -367,8 +376,8 @@ makeRPCTest expected (Right (TestData scriptSig scriptPubKey comment)) =
                                          ("rpc error: " ++ show error) False
     where
         rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
-        hexSig = bsToHex $ BS.pack scriptSig
-        hexKey = bsToHex $ BS.pack scriptPubKey
+        hexSig = bsToHex $ LBS.toStrict scriptSig
+        hexKey = bsToHex $ LBS.toStrict scriptPubKey
         params = LBS.toStrict . A.encode $ [hexSig, hexKey]
         -- params = LBS.toStrict . A.encode $ (["51", "51"] :: [String])
         parseResponse v = case AT.parse getValue v of
