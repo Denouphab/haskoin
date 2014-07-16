@@ -13,6 +13,7 @@ module Network.Haskoin.Script.Evaluator
 , evalScript
 , SigCheck
 -- * Evaluation data types
+, EvalError
 , Program
 , Stack
 -- * Helper functions
