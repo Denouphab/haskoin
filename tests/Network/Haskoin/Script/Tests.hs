@@ -46,7 +46,6 @@ import qualified Data.ByteString.Lazy as LBS
     ( ByteString
     , concat
     , pack
-    , unpack
     , toStrict
     )
 
@@ -110,7 +109,7 @@ tests =
                False
     , testGroup "Compare Haskoin Impl against Bitcoin Impl"
         [ testProperty "Haskoin evalScript == Bitcoin evalScript"
-                       testCompareScript
+                       testCompareFullEval
         ]
     ]
 
@@ -349,34 +348,50 @@ runTests ts = defaultMainWithArgs ts ["--hide-success"]
 --
 -- needs patched bitcoind that supports 'execscript' rpc command
 
-evalRawRPC :: EncodedScript -> EncodedScript -> IO Bool
-evalRawRPC sigData pubKeyData =
-    callApi rpcAuth "execscript" params >>= traceResponse >>= evalResponse
-    where evalResponse (Right (A.Object v)) = return $ parseResponse v
-          evalResponse (Right _) = fail "unexpected response type"
-          evalResponse (Left error) = fail $ "RPC error: " ++ error
-          rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
+-- TODO parse returned stack
+
+data ExecScriptResponse = ExecScriptResponse { stack :: Stack
+                                             , valid :: Bool
+                                             -- , string :: String
+                                             } deriving (Show)
+
+instance AT.FromJSON ExecScriptResponse where
+    parseJSON (AT.Object v) =
+        ExecScriptResponse <$> (v AT..: "stack" >>= parseStack)
+                           <*> (v AT..: "valid")
+                           -- <*> return (bsToString $ LBS.toStrict $ A.encode v)
+        where asStrings = AT.parseMaybe AT.parseJSON
+              asStackValues vals = join $ mapM parseHex' <$> asStrings vals
+              parseStack v = maybe mzero return (reverse <$> asStackValues v)
+    parseJSON _ = mzero
+
+
+execRawRPC :: EncodedScript -> EncodedScript -> IO ExecScriptResponse
+execRawRPC sigData pubKeyData = callApi rpcAuth "execscript" params
+                                >>= readResponse
+    where rpcAuth = RPCAuth "http://127.0.0.1:18332" "bitcoinrpc" "testnet"
           hexSig = bsToHex $ LBS.toStrict sigData
           hexKey = bsToHex $ LBS.toStrict pubKeyData
           params = LBS.toStrict . A.encode $ [hexSig, hexKey]
-          parseResponse v = case AT.parse getValue v of
-              AT.Success True -> True
-              _ -> False
-          getValue o = o A..: "valid"
-          traceResponse v = do -- putStrLn $ "response: " ++
-                               --         (bsToString . LBS.toStrict)
-                               --         (A.encode v)
-                               return v
+          dumpResponse = bsToString . LBS.toStrict . A.encode
+          readResponse (Right v) =
+                case AT.parseMaybe AT.parseJSON v :: Maybe ExecScriptResponse of
+                     Just r -> return r
+                     Nothing -> fail $ "decode error: " ++ dumpResponse v
+          readResponse (Left error) =
+                fail $ "RPC error: " ++ error
+
+evalRawRPC :: EncodedScript -> EncodedScript -> IO Bool
+evalRawRPC sigData pubKeyData = valid <$> execRawRPC sigData pubKeyData
 
 evalRpc :: Script -> Script -> IO Bool
 evalRpc sig pubKey = evalRawRPC (encode sig) (encode pubKey)
 
-evalRpcString :: String -> String -> IO Bool
-evalRpcString sig pubKey =
-    case evalRpc <$> (decodeScript =<< parseScript sig)
-                 <*> (decodeScript =<< parseScript pubKey) of
+execRpcString :: String -> String -> IO ()
+execRpcString sig pubKey =
+    case execRawRPC <$> parseScript sig <*> parseScript pubKey of
         Left error -> fail $ "decode error: " ++ error
-        Right result -> result
+        Right resultIO -> resultIO >>= print
 
 makeRPCTest :: Bool -> TestParseResult -> Test
 makeRPCTest expected (Left error) =
@@ -388,11 +403,13 @@ makeRPCTest expected (Right (TestData sigData pubKeyData comment)) =
                                              (rpcResult == expected)
 
 
+
+pathValid = "tests/data/script_valid.json"
+pathInvalid = "tests/data/script_invalid.json"
+
 runRPCTests :: IO ()
 runRPCTests =
   let label = "RPC tests"
-      pathValid = "tests/data/script_valid.json"
-      pathInvalid = "tests/data/script_invalid.json"
       rpcTestValid = execFileTests label pathValid (makeRPCTest True)
       rpcTestInvalid = execFileTests label pathInvalid (makeRPCTest False)
   in runTests [rpcTestValid, rpcTestInvalid]
@@ -400,10 +417,7 @@ runRPCTests =
 
 runStaticComparisonTest :: IO ()
 runStaticComparisonTest =
-  let label = "RPC tests"
-      pathValid = "tests/data/script_valid.json"
-      pathInvalid = "tests/data/script_invalid.json"
-
+  let label = "RPC comparison tests"
       cmpTest (Right (TestData sig key comment)) =
         buildTest $ do rpcResult <- evalRawRPC sig key
                        evalResult <- evalEncoded sig key
@@ -423,15 +437,71 @@ runStaticComparisonTest =
   in runTests [cmpTestValid, cmpTestInvalid]
 
 
-compareEval :: Script -> Script -> IO Bool
-compareEval sig pubKey = ((==) (evalScript' sig pubKey)) <$> evalRpc sig pubKey
+compareFullEval :: Script -> Script -> IO Bool
+compareFullEval sig pubKey = (evalScript' sig pubKey ==) <$> evalRpc sig pubKey
 
-testCompareScript :: Script -> Script -> Property
-testCompareScript sig pubKey =
-    QM.monadicIO $ QM.assert =<< (QM.run $ compareEval sig pubKey)
+testCompareFullEval :: Script -> Script -> Property
+testCompareFullEval sig pubKey =
+    QM.monadicIO $ QM.assert =<< QM.run (compareFullEval sig pubKey)
 
 
 testDeep :: IO ()
 testDeep = quickCheckWith (stdArgs { maxSuccess = 10000
                                    , maxDiscardRatio = 10000 })
-                          testCompareScript
+                          testCompareFullEval
+
+{- methods for comparing execution results -}
+
+data ExecResult = ExecInvalid | ExecValid Stack deriving (Show, Eq)
+
+compareFullExec :: Script -> Script -> IO Bool
+compareFullExec scriptSig scriptPubKey = do
+    let resultA = case execScript' scriptSig scriptPubKey of
+                       Left err -> ExecInvalid
+                       Right p  -> if checkStack . runStack $ p
+                                       then ExecValid $ runStack p
+                                       else ExecInvalid
+
+    rpcResult <- execRawRPC (encode scriptSig) (encode scriptPubKey)
+    let resultB = if valid rpcResult
+                      then ExecValid $ stack rpcResult
+                      else ExecInvalid
+
+    return $ resultA == resultB
+
+emptyScript :: Script
+emptyScript = Script []
+
+dumpError :: Script -> IO ()
+dumpError script = do
+        putStrLn $ "script:" ++ show (scriptOps script)
+        putStrLn "Haskoin Exec:"
+        case execScript' emptyScript script of
+            Left error -> putStrLn $ "error: " ++ show error
+            Right p -> dumpResult (checkStack $ runStack p) (runStack p)
+
+        putStrLn "BitcoinD Exec:"
+        rpcResponse <- execRawRPC (encode emptyScript) (encode script)
+        dumpResult (valid rpcResponse) (stack rpcResponse)
+
+    where dumpResult valid stack = do
+            putStrLn $ "  valid: " ++ show valid
+            putStrLn $ "  stack: " ++ show stack
+
+dumpErrorIO :: String -> IO ()
+dumpErrorIO script = case parseScript script >>= decodeScript of
+                          Left e -> putStrLn $ "dumpErrorIO: decode error" ++ e
+                          Right s -> dumpError s
+
+findErrors :: IO ()
+findErrors = quickCheckWith argsTestDeep testSingleExec
+    where testSingleExec :: Script -> Property
+          testSingleExec script = whenFail (dumpError script) $
+              QM.monadicIO $ QM.assert =<<
+              QM.run (compareFullExec emptyScript script)
+
+          argsTestDeep = stdArgs { maxSuccess = 10000
+                                 , maxDiscardRatio = 10000
+                                 }
+
+main = findErrors

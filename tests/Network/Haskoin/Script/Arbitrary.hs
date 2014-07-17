@@ -12,6 +12,7 @@ import Test.QuickCheck
     ( Gen
     , Arbitrary
     , arbitrary
+    , shrink
     , oneof
     , choose
     , vectorOf
@@ -33,6 +34,11 @@ instance Arbitrary Script where
     arbitrary = do
         i <- choose (1,10)
         Script <$> vectorOf i arbitrary
+
+    shrink (Script []) = []
+    shrink (Script s) = map Script (zipWith drop1 [0..] s)
+                        where drop1 n _ = take n s ++ drop (n+1) s
+    -- shrink (Script s) = [Script (init s)]
 
 instance Arbitrary ScriptOp where
     arbitrary = oneof [ opPushData <$> arbitrary
