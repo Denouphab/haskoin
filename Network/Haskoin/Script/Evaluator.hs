@@ -65,6 +65,9 @@ maxStackSize = 1000
 maxOpcodes :: Int
 maxOpcodes = 200
 
+maxKeysMultisig :: Int
+maxKeysMultisig = 20
+
 data EvalError =
     EvalError String
     | ProgramError String Program
@@ -311,8 +314,9 @@ popStack :: ProgramTransition StackValue
 popStack = withStack >>= \(s:ss) -> putStack ss >> return s
 
 popStackN :: Integer -> ProgramTransition [StackValue]
-popStackN 0 = return []
-popStackN n = (:) <$> popStack <*> popStackN (n - 1)
+popStackN n | n < 0     = programError "popStackN: negative argument"
+            | n == 0    = return []
+            | otherwise = (:) <$> popStack <*> popStackN (n - 1)
 
 pickStack :: Bool -> Int -> ProgramTransition ()
 pickStack remove n = do
@@ -524,8 +528,16 @@ eval OP_CHECKSIG = do
   pushBool $ checkMultiSig checker [ pubKey ] [ sig ] hOps
 
 eval OP_CHECKMULTISIG =
-    do pubKeys <- popInt >>= popStackN . fromIntegral
-       sigs <- popInt >>= popStackN . fromIntegral
+    do nPubKeys <- fromIntegral <$> popInt
+       when (nPubKeys < 0 || nPubKeys > maxKeysMultisig)
+            $ programError $ "nPubKeys outside range: " ++ show nPubKeys
+       pubKeys <- popStackN $ toInteger nPubKeys
+
+       nSigs <- fromIntegral <$> popInt
+       when (nSigs < 0 || nSigs > nPubKeys)
+            $ programError $ "nSigs outside range: " ++ show nSigs
+       sigs <- popStackN $ toInteger nSigs
+
        void popStack -- spec bug
        checker <- sigCheck <$> get
        hOps <- preparedHashOps
@@ -658,7 +670,7 @@ runStack = stack
 
 -- | A wrapper around 'verifySig' which handles grabbing the hash type
 verifySigWithType :: Tx -> Int -> [ ScriptOp ] -> TxSignature -> PubKey -> Bool
-verifySigWithType tx i outOps txSig pubKey = 
+verifySigWithType tx i outOps txSig pubKey =
   let outScript = Script outOps
       h = txSigHash tx outScript i ( sigHashType txSig ) in
   verifySig h ( txSignature txSig ) pubKey
