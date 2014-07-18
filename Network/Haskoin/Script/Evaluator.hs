@@ -171,6 +171,7 @@ decodeInt bytes = sign' (decodeW bytes)
                   | otherwise = i
 
 -- | Conversion of StackValue to Bool (true if non-zero).
+-- FIXME CastToBool does *not* convert to int, recognizes values > 64bit
 decodeBool :: StackValue -> Bool
 decodeBool v = decodeInt v /= 0
 
@@ -245,7 +246,7 @@ pushInt :: Int64 -> ProgramTransition ()
 pushInt = pushStack . encodeInt
 
 popBool :: ProgramTransition Bool
-popBool = decodeBool <$> popStack
+popBool = (0 /=) <$> popInt
 
 pushBool :: Bool -> ProgramTransition ()
 pushBool = pushStack . encodeBool
@@ -441,7 +442,7 @@ eval OP_NOP8    = return ()
 eval OP_NOP9    = return ()
 eval OP_NOP10   = return ()
 
-eval OP_VERIFY = decodeBool <$> popStack >>= \case
+eval OP_VERIFY = popBool >>= \case
     False -> programError "OP_VERIFY failed"
     True  -> return ()
 
@@ -471,7 +472,7 @@ eval OP_2SWAP   = tStack4 $ \a b c d -> [c, d, a, b]
 
 -- Splice
 
-eval OP_SIZE   = (fromIntegral . length <$> popStack) >>= pushStack . encodeInt
+eval OP_SIZE   = (fromIntegral . length <$> head <$> withStack) >>= pushInt
 
 -- Bitwise Logic
 
