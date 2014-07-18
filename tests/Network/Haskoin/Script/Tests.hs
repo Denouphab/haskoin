@@ -472,8 +472,8 @@ compareFullExec scriptSig scriptPubKey = do
 emptyScript :: Script
 emptyScript = Script []
 
-dumpError :: Script -> IO ()
-dumpError script = do
+dumpExec :: Script -> IO ()
+dumpExec script = do
         putStrLn $ "script:" ++ show (scriptOps script)
         putStrLn "Haskoin Exec:"
         case execScript' emptyScript script of
@@ -488,20 +488,21 @@ dumpError script = do
             putStrLn $ "  valid: " ++ show valid
             putStrLn $ "  stack: " ++ show stack
 
-dumpErrorIO :: String -> IO ()
-dumpErrorIO script = case parseScript script >>= decodeScript of
-                          Left e -> putStrLn $ "dumpErrorIO: decode error" ++ e
-                          Right s -> dumpError s
+dumpExecIO :: String -> IO ()
+dumpExecIO script = case parseScript script >>= decodeScript of
+                          Left e -> putStrLn $ "dumpExecIO: decode error" ++ e
+                          Right s -> dumpExec s
 
 findErrors :: IO ()
 findErrors = quickCheckWith argsTestDeep testSingleExec
     where testSingleExec :: Script -> Property
-          testSingleExec script = whenFail (dumpError script) $
-              QM.monadicIO $ QM.assert =<<
-              QM.run (compareFullExec emptyScript script)
+          testSingleExec script = whenFail (dumpExec script) $
+              evalScript' emptyScript script ==>
+                  QM.monadicIO $ QM.assert =<<
+                  QM.run (compareFullExec emptyScript script)
 
-          argsTestDeep = stdArgs { maxSuccess = 10000
-                                 , maxDiscardRatio = 10000
+          argsTestDeep = stdArgs { maxSuccess = 1000000
+                                 , maxDiscardRatio = 100000
                                  }
 
 main = findErrors
