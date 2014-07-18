@@ -161,19 +161,24 @@ encodeInt i = prefix $ encode' (fromIntegral $ abs i) []
                     | otherwise = xs
 
 -- | Inverse of `encodeInt`.
-decodeInt :: StackValue -> Int64
-decodeInt bytes = sign' (decodeW bytes)
-    where decodeW [] = 0
-          decodeW [x] = fromIntegral $ clearBit x 7
-          decodeW (x:xs) = fromIntegral x + decodeW xs `shiftL` 8
-          sign' i | null bytes = 0
-                  | testBit (last bytes) 7 = -i
-                  | otherwise = i
+decodeInt :: StackValue -> Maybe Int64
+decodeInt bytes | length bytes > 4 = Nothing
+                | otherwise = Just $ sign' (decodeW bytes)
+                  where decodeW [] = 0
+                        decodeW [x] = fromIntegral $ clearBit x 7
+                        decodeW (x:xs) = fromIntegral x + decodeW xs `shiftL` 8
+                        sign' i | null bytes = 0
+                                | testBit (last bytes) 7 = -i
+                                | otherwise = i
 
 -- | Conversion of StackValue to Bool (true if non-zero).
 -- FIXME CastToBool does *not* convert to int, recognizes values > 64bit
 decodeBool :: StackValue -> Bool
-decodeBool v = decodeInt v /= 0
+decodeBool []     = False
+decodeBool [0x00] = False
+decodeBool [0x80] = False
+decodeBool [_]    = True
+decodeBool (_:vs) = decodeBool vs
 
 encodeBool :: Bool -> StackValue
 encodeBool True = [1]
@@ -236,11 +241,9 @@ countOp op | isConstant op     = False
            | otherwise         = True
 
 popInt :: ProgramTransition Int64
-popInt = popStack >>= \sv ->
-    if length sv > 4 then
-        programError $ "integer > nMaxNumSize: " ++ show (length sv)
-    else
-        return $ decodeInt sv
+popInt = decodeInt <$> popStack >>= \case
+    Nothing -> programError "popInt: data > nMaxNumSize"
+    Just i -> return i
 
 pushInt :: Int64 -> ProgramTransition ()
 pushInt = pushStack . encodeInt
@@ -489,8 +492,10 @@ eval OP_NOT         = arith1 $ \case 0 -> 1; _ -> 0
 eval OP_0NOTEQUAL   = arith1 $ \case 0 -> 0; _ -> 1
 eval OP_ADD     = arith2 (+)
 eval OP_SUB     = arith2 $ flip (-)
-eval OP_BOOLAND     = (&&) <$> popBool <*> popBool >>= pushBool
-eval OP_BOOLOR      = (||) <$> popBool <*> popBool >>= pushBool
+eval OP_BOOLAND     = (&&) <$> ((0 /=) <$> popInt)
+                           <*> ((0 /=) <$> popInt) >>= pushBool
+eval OP_BOOLOR      = (||) <$> ((0 /=) <$> popInt)
+                           <*> ((0 /=) <$> popInt) >>= pushBool
 eval OP_NUMEQUAL    = (==) <$> popInt <*> popInt >>= pushBool
 eval OP_NUMEQUALVERIFY = eval OP_NUMEQUAL >> eval OP_VERIFY
 eval OP_NUMNOTEQUAL         = (/=) <$> popInt <*> popInt >>= pushBool
