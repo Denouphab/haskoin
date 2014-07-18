@@ -16,6 +16,8 @@ import Test.Framework.Providers.QuickCheck2 (testProperty)
 
 import Test.Framework.Runners.Console (defaultMainWithArgs)
 
+import Control.Concurrent as CC
+
 import qualified Test.HUnit as HUnit
 
 import Network.BitcoinRPC
@@ -499,16 +501,35 @@ dumpExecIO script = case parseScript script >>= decodeScript of
                           Left e -> putStrLn $ "dumpExecIO: decode error" ++ e
                           Right s -> dumpExec s
 
+
 findErrors :: IO ()
 findErrors = quickCheckWith argsTestDeep testSingleExec
     where testSingleExec :: Script -> Property
           testSingleExec script = whenFail (dumpExec script) $
-              evalScript' emptyScript script ==>
                   QM.monadicIO $ QM.assert =<<
                   QM.run (compareFullExec emptyScript script)
 
-          argsTestDeep = stdArgs { maxSuccess = 1000000
+          argsTestDeep = stdArgs { maxSuccess = 100000
                                  , maxDiscardRatio = 100000
                                  }
 
-main = findErrors
+
+
+
+
+findErrorsSingleOp :: IO ()
+findErrorsSingleOp = quickCheckWith argsTestDeep testSingleOp
+    where testSingleOp :: ScriptSingleOp -> Property
+          testSingleOp (ScriptSingleOp script) =
+              evalScript' emptyScript script ==>
+                  whenFail (dumpExec script) $
+                      QM.monadicIO $ QM.assert =<<
+                      QM.run (compareFullExec emptyScript script)
+
+          argsTestDeep = stdArgs { maxSuccess = 100000
+                                 , maxDiscardRatio = 100000
+                                 }
+
+main :: IO ()
+-- main = return ()
+main = findErrorsSingleOp
